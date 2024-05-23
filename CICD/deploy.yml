@@ -1,48 +1,71 @@
-parameters:
-  - name: stageId
-    type: string
-  - name: dependsOn
-    type: object
-    default: []
-  - name: catalog
-    type: string
-  - name: env
-    type: string
-  - name: environmentName
-    type: string
-  - name: resourceGroupName
-    type: string
-  - name: serviceConnection
-    type: string
-  - name: notebookPath
-    type: string
+# .github/workflows/deploy.yml
+name: Deploy
 
-stages:
-  - stage: "${{ parameters.stageId }}"
-    displayName: "Deploying to [${{ upper(parameters.env) }}] environment"
-    dependsOn: ${{ parameters.dependsOn }}
-    jobs:
-      - deployment: Deploy
-        displayName: "Deploying Databricks Notebooks"
-        environment: ${{ parameters.environmentName }}
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - checkout: self
-                - task: AzureCLI@2
-                  inputs:
-                    azureSubscription: ${{ parameters.serviceConnection }}
-                    scriptType: "pscore"
-                    scriptLocation: "inlineScript"
-                    inlineScript: |
-                      az config set extension.use_dynamic_install=yes_without_prompt
-                      
-                      $databricksWorkspace = (az resource list --resource-group ${{parameters.resourceGroupName}} --query "[?type =='Microsoft.Databricks/workspaces']" | ConvertFrom-Json)[0]
-                      $databricksWorkspaceInfo = (az databricks workspace show --ids $databricksWorkspace.id | ConvertFrom-Json)
-                      
-                      $bearerToken = $(Build.Repository.LocalPath)/CICD/shellScript/DBToken.ps1 -databricksWorkspaceResourceId $databricksWorkspaceInfo.id -databricksWorkspaceUrl $databricksWorkspaceInfo.workspaceUrl
-                      
-                      Install-Module -Name azure.databricks.cicd.tools -Force -Scope CurrentUser
-                      Import-Module -Name azure.databricks.cicd.tools
-                      Import-DatabricksFolder -BearerToken $bearerToken -Region $databricksWorkspaceInfo.location -LocalPath $(Build.Repository.LocalPath)/${{ parameters.notebookPath }} -DatabricksPath '/live' -Clean
+on:
+  workflow_call:
+    inputs:
+      stageId:
+        required: true
+        type: string
+      dependsOn:
+        required: false
+        type: array
+        default: []
+      catalog:
+        required: true
+        type: string
+      env:
+        required: true
+        type: string
+      environmentName:
+        required: true
+        type: string
+      resourceGroupName:
+        required: true
+        type: string
+      serviceConnection:
+        required: true
+        type: string
+      notebookPath:
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ inputs.serviceConnection }}
+
+      - name: Set up Azure CLI
+        run: az config set extension.use_dynamic_install=yes_without_prompt
+
+      - name: Get Databricks Workspace Info
+        id: databricks
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt
+          databricksWorkspace=$(az resource list --resource-group ${{ inputs.resourceGroupName }} --query "[?type == 'Microsoft.Databricks/workspaces']" | jq -r '.[0]')
+          echo "::set-output name=id::$(echo $databricksWorkspace | jq -r '.id')"
+          echo "::set-output name=workspaceUrl::$(az databricks workspace show --ids $(echo $databricksWorkspace | jq -r '.id') | jq -r '.workspaceUrl')"
+          echo "::set-output name=location::$(az databricks workspace show --ids $(echo $databricksWorkspace | jq -r '.id') | jq -r '.location')"
+
+      - name: Get Bearer Token
+        id: token
+        run: |
+          bearerToken=$(./CICD/shellScript/DBToken.ps1 -databricksWorkspaceResourceId ${{ steps.databricks.outputs.id }} -databricksWorkspaceUrl ${{ steps.databricks.outputs.workspaceUrl }})
+          echo "::set-output name=bearerToken::$bearerToken"
+
+      - name: Install Azure Databricks CI/CD Tools
+        run: |
+          Install-Module -Name azure.databricks.cicd.tools -Force -Scope CurrentUser
+          Import-Module -Name azure.databricks.cicd.tools
+
+      - name: Deploy Notebooks
+        run: |
+          Import-DatabricksFolder -BearerToken ${{ steps.token.outputs.bearerToken }} -Region ${{ steps.databricks.outputs.location }} -LocalPath ${{ github.workspace }}/${{ inputs.notebookPath }} -DatabricksPath '/live' -Clean
